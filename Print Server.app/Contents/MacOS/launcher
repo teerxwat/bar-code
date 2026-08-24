@@ -1,0 +1,7 @@
+#!/bin/bash
+# เปิด Terminal แล้วรัน print server — .app นี้ต้องอยู่ในโฟลเดอร์เดียวกับ tsc_te310_print_server.py
+APP_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+CMD="cd '$APP_DIR' && echo '=== TSC TE310 Print Server ===' && if command -v python3 >/dev/null 2>&1; then python3 tsc_te310_print_server.py; else python tsc_te310_print_server.py; fi"
+ESCAPED=${CMD//\"/\\\"}
+osascript -e "tell application \"Terminal\" to activate" \
+          -e "tell application \"Terminal\" to do script \"$ESCAPED\""
