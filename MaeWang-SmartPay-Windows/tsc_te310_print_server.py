@@ -30,7 +30,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import usb.core
 import usb.util
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, features
+
+# RAQM (libraqm) จำเป็นสำหรับจัดวางสระ/วรรณยุกต์ภาษาไทยให้ถูกตำแหน่ง
+# บน macOS ที่ลง libusb ผ่าน brew มักมีให้; บน Windows มักไม่มี (ต้องลง DLL เพิ่ม)
+# ถ้าไม่มีจะ fallback เป็น BASIC layout — ไทยพิมพ์ออกแต่สระ/วรรณยุกต์อาจเพี้ยน
+_HAVE_RAQM = features.check("raqm")
+_LAYOUT = ImageFont.Layout.RAQM if _HAVE_RAQM else ImageFont.Layout.BASIC
 
 # หาฟอนต์ไทยจาก path ของสคริปต์เอง (ไม่ใช่ cwd ที่รันคำสั่ง) — รองรับทั้งกรณี
 # ไฟล์ฟอนต์อยู่ข้างสคริปต์โดยตรง และอยู่ในโฟลเดอร์ fonts/
@@ -58,6 +64,12 @@ def _env_hex(name):
 
 VENDOR_ID = _env_hex("TSC_VID")
 PRODUCT_ID = _env_hex("TSC_PID")
+
+# Vendor ID ของ TSC Auto ID Technology — เครื่อง TSC บางรุ่น (เช่น TE310) รายงาน
+# ชื่อ USB (manufacturer/product) มาเป็นค่าว่าง เลยจับด้วยชื่อ "TSC" ไม่ได้
+# ต้องรู้จัก VID ไว้ด้วยถึงจะแยกออกจากเครื่องปริ้นเอกสาร (เช่น Brother=0x04f9)
+TSC_VENDOR_IDS = {0x1203}
+
 DENSITY = 10
 SPEED = 3
 W, H = 590, 354  # 50mm x 30mm @300dpi
@@ -101,8 +113,7 @@ def check_thai_font():
 def load_font(paths, size, index=0):
     for p in paths:
         try:
-            f = ImageFont.truetype(p, size, index=index,
-                                    layout_engine=ImageFont.Layout.RAQM)
+            f = ImageFont.truetype(p, size, index=index, layout_engine=_LAYOUT)
         except Exception:
             try:
                 f = ImageFont.truetype(p, size, index=index)
@@ -312,9 +323,11 @@ def find_printer():
 
     candidates = list(_usb_find(find_all=True))
 
-    # 2) หาจากชื่อ TSC/TE310 — เครื่องปริ้นเอกสารชื่อไม่มี "TSC" เลยถูกข้ามอัตโนมัติ
+    # 2) หาเครื่อง TSC จาก Vendor ID หรือชื่อ — เครื่องปริ้นเอกสาร (Brother ฯลฯ)
+    #    VID/ชื่อไม่ตรง เลยถูกข้ามอัตโนมัติ
     tsc = [d for d in candidates
-           if "TSC" in _safe_string(d, d.iManufacturer)
+           if d.idVendor in TSC_VENDOR_IDS
+           or "TSC" in _safe_string(d, d.iManufacturer)
            or "TSC" in _safe_string(d, d.iProduct)
            or "TE310" in _safe_string(d, d.iProduct)]
     if len(tsc) == 1:
@@ -461,6 +474,9 @@ def main():
     # http://localhost:9100 หรือ http://127.0.0.1:9100 — เปิดที่ 0.0.0.0/IP สาธารณะแล้ว
     # เว็บแอปจะเรียกไม่ได้เลย (ถูกเบราว์เซอร์บล็อกตั้งแต่ต้น)
     check_thai_font()
+    if not _HAVE_RAQM:
+        print("*** คำเตือน: ไม่มี RAQM (libraqm) — สระ/วรรณยุกต์ภาษาไทยอาจวางผิดตำแหน่ง")
+        print("*** ถ้าป้ายภาษาไทยเพี้ยน ดูวิธีลง raqm ใน README-Windows.txt ข้อ 'ภาษาไทยเพี้ยน'")
     httpd = HTTPServer(("127.0.0.1", PRINT_SERVER_PORT), PrintRequestHandler)
     print(f"Print server กำลังทำงานที่ http://localhost:{PRINT_SERVER_PORT}")
     print("รอรับคำสั่งพิมพ์จากเว็บแอป SmartPay (POST /print) — กด Ctrl+C เพื่อหยุด")
