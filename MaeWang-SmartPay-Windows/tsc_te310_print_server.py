@@ -355,21 +355,45 @@ def find_printer():
 
 
 def send(dev, data: bytes):
+    # (Windows) detach kernel driver ไม่รองรับ — จับ error ทิ้งได้เลย
     try:
         if dev.is_kernel_driver_active(0):
             dev.detach_kernel_driver(0)
     except (NotImplementedError, usb.core.USBError):
         pass
-    dev.set_configuration()
-    cfg = dev.get_active_configuration()
-    intf = cfg[(0, 0)]
-    ep_out = usb.util.find_descriptor(
-        intf,
-        custom_match=lambda e:
-            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
-    )
+
+    try:
+        dev.set_configuration()
+    except usb.core.USBError as e:
+        # บางครั้งอุปกรณ์ถูกตั้ง config ไว้แล้ว การตั้งซ้ำจะเตือน — ไปต่อได้
+        print(f"[print-server] set_configuration เตือน (ข้ามได้): {e}")
+
+    # หา bulk OUT endpoint จาก "ทุก" interface/config ไม่ยึดแค่ (0,0)
+    # เพราะบางเครื่อง/บนไดรเวอร์ WinUSB endpoint อาจไม่ได้อยู่ interface แรก
+    ep_out = None
+    for cfg in dev:
+        for intf in cfg:
+            ep = usb.util.find_descriptor(
+                intf,
+                custom_match=lambda e:
+                    usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+            )
+            if ep is not None:
+                ep_out = ep
+                break
+        if ep_out is not None:
+            break
+
     if ep_out is None:
-        raise RuntimeError("ไม่เจอ bulk OUT endpoint")
+        seen = []
+        for cfg in dev:
+            for intf in cfg:
+                for e in intf:
+                    direction = "OUT" if usb.util.endpoint_direction(
+                        e.bEndpointAddress) == usb.util.ENDPOINT_OUT else "IN"
+                    seen.append(f"{hex(e.bEndpointAddress)}({direction})")
+        raise RuntimeError(f"ไม่เจอ bulk OUT endpoint — endpoints ที่เห็น: {seen or 'ไม่มีเลย'}")
+
     written = ep_out.write(data, timeout=10000)
     usb.util.dispose_resources(dev)
     return written
@@ -457,10 +481,17 @@ class PrintRequestHandler(BaseHTTPRequestHandler):
             n = print_label(user_id=user_id, house=house, moo=moo, soi=soi,
                             name=name, tambon=tambon, quantity=quantity)
         except RuntimeError as e:
+            print(f"[print-server] *** พิมพ์ไม่สำเร็จ (RuntimeError): {e}")
             self._send_json(503, {"error": str(e)})
             return
         except usb.core.USBError as e:
+            print(f"[print-server] *** พิมพ์ไม่สำเร็จ (USBError): {e}")
             self._send_json(502, {"error": f"USB error: {e}"})
+            return
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._send_json(500, {"error": f"{type(e).__name__}: {e}"})
             return
 
         print(f"พิมพ์ให้ {user_id} ({name or '-'} | {house} หมู่ {moo or '-'} {tambon or '-'}) x{quantity} — ส่งไป {n} bytes")
