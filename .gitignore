@@ -1,6 +1,12 @@
 # macOS
 .DS_Store
 
+# ค่าลับ (คีย์/โทเค็น) — ห้าม commit
+.env
+
+# รูปพรีวิวที่ mock mode เซฟไว้ (สร้างใหม่ได้ตลอด ไม่ต้องเก็บ)
+previews/
+
 # Python
 __pycache__/
 *.py[cod]
