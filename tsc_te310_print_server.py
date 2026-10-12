@@ -50,9 +50,16 @@ tambon มา สร้างป้ายให้พร้อมสั่งพ
 """
 import json
 import os
+import hashlib
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import usb.core
@@ -69,6 +76,21 @@ _LAYOUT = ImageFont.Layout.RAQM if _HAVE_RAQM else ImageFont.Layout.BASIC
 # ไฟล์ฟอนต์อยู่ข้างสคริปต์โดยตรง และอยู่ในโฟลเดอร์ fonts/
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(SCRIPT_DIR, "fonts")
+
+# เวอร์ชันของแอป — ตัวติดตั้ง Windows (windows-installer/build_windows.py) อ่านค่านี้ไปใช้
+# ออกเวอร์ชันใหม่ให้แก้เลขตรงนี้ที่เดียว
+__version__ = "1.0.0"
+
+# รันจากแอปที่ติดตั้ง (แพ็กด้วย PyInstaller): .env / previews อยู่ข้างไฟล์ .exe
+# (โฟลเดอร์ติดตั้ง) ส่วนฟอนต์ที่แพ็กมาด้วยอยู่ในโฟลเดอร์ของ PyInstaller (sys._MEIPASS)
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    FONT_DIR = sys._MEIPASS
+    # console ที่ไม่ใช่ UTF-8 เจอตัวอักษรไทยใน log แล้วห้ามทำให้ server ล้ม
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None:
+            _stream.reconfigure(errors="replace")
 
 
 # โหลดไฟล์ .env (ถ้ามี) ข้างสคริปต์ — เก็บค่าที่ไม่อยากพิมพ์ซ้ำทุกครั้งตอนรัน server
@@ -92,6 +114,9 @@ def _load_dotenv(path):
 
 
 _load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+# ค่าเริ่มต้นที่ตัวติดตั้ง Windows ใส่มาให้ (เช่น SMARTPAY_PRINT_KEY) — โหลดทีหลัง .env
+# ดังนั้นค่าใน .env ของเครื่องนั้นชนะเสมอ และไฟล์นี้ถูกเขียนทับทุกครั้งที่อัปเดตแอป
+_load_dotenv(os.path.join(SCRIPT_DIR, "default.env"))
 
 # ============== ค่าเครื่อง / ขนาด ==============
 # Pin เครื่องบาร์โค้ดด้วย VID/PID ได้ผ่าน env var (เลขฐาน 16 เช่น 0x1203)
@@ -127,6 +152,7 @@ GAP_MM = 3  # ระยะ gap ระหว่างป้ายบนม้ว�
 INVERT_BITMAP = False
 
 BAND_W = 150  # ความกว้างแถบดำซ้าย
+PAMPER_FONT_SIZE = 56  # ขนาดคำว่า "แพมเพิส" ในแถบดำ (บรรทัดที่อยู่ = 36)
 
 # บาร์โค้ด (เน้นใหญ่) — วางในโซนขวา
 BAR_X = 250  # ขยับซ้าย-ขวาให้อยู่กึ่งกลางโซนขวา
@@ -135,6 +161,14 @@ BAR_HEIGHT = 158
 BAR_NARROW = 3  # 2=เล็ก 3=กลาง 4=ใหญ่
 
 PRINT_SERVER_PORT = 9100
+# อัปเดตแอป (เฉพาะแอปที่ติดตั้งบน Windows): URL ของไฟล์ latest.json ที่วางคู่กับตัวติดตั้ง
+# เวอร์ชันล่าสุด (build_windows.py สร้างให้ทั้งคู่ใน windows-installer/output/) ต้องเป็น https
+# เช่น GitHub Releases: https://github.com/<owner>/<repo>/releases/latest/download/latest.json
+# เว้นว่าง = ไม่เช็กอัปเดต
+UPDATE_MANIFEST_URL = os.environ.get(
+    "SMARTPAY_UPDATE_URL", "https://github.com/teerxwat/bar-code/releases/latest/download/latest.json")
+# หน้าเว็บแอปที่แอปติดตั้งเปิดให้อัตโนมัติตอนสตาร์ท (ปิดได้ด้วย --no-browser)
+SMARTPAY_LOGIN_URL = "https://www.maewang-smartpay.donaus-dev.net/login"
 
 # MOCK MODE — ทดสอบ /print ได้โดยไม่ต้องมีเครื่องพิมพ์ต่ออยู่จริง เปิดด้วย
 # --mock ตอนรัน หรือ env TSC_MOCK=1 — จะข้ามขั้นตอนหา/ส่งข้อมูลไป USB ทั้งหมด
@@ -245,24 +279,30 @@ def build_house_moo_text(house: str, moo: str = "", soi: str = "") -> str:
     return " ".join(parts)
 
 
-def render_band_tile(lines, max_text_width: int, max_total_height: int) -> Image.Image:
+def render_band_tile(lines, max_text_width: int, max_total_height: int,
+                     line_max_sizes=None) -> Image.Image:
     """
     วาดข้อความหลายบรรทัด (ตัวขาวบนพื้นดำ) เป็น tile แนวนอน แล้วหมุน 90°
     ให้อ่านจากล่างขึ้นบน — แต่ละบรรทัดลดขนาดฟอนต์อัตโนมัติให้กว้างไม่เกิน
     max_text_width และถ้าความสูงรวมทุกบรรทัด (= ความกว้างแถบดำหลังหมุน)
     เกิน max_total_height จะบีบ max_size ลงแล้ววาดใหม่ทั้งชุด
+    line_max_sizes: ขนาดฟอนต์สูงสุดแยกรายบรรทัด (None = 36 ทุกบรรทัด) เช่นให้คำว่า
+    "แพมเพิส" ใหญ่กว่าบรรทัดที่อยู่
     """
     tmp = ImageDraw.Draw(Image.new("1", (4, 4), 0))
     gap = 14  # ระยะห่างระหว่างบรรทัด
-    max_size = 36  # ขนาดปกติของข้อความสั้น (ข้อความยาวจะหดลงจากนี้)
+    # ขนาดปกติของข้อความสั้น (ข้อความยาวจะหดลงจากนี้)
+    base_sizes = line_max_sizes or [36] * len(lines)
+    shrink = 0
     while True:
-        fonts = [fit_side_text_font(t, max_text_width, max_size=max_size)[0] for t in lines]
+        sizes = [max(10, b - shrink) for b in base_sizes]
+        fonts = [fit_side_text_font(t, max_text_width, max_size=m)[0] for t, m in zip(lines, sizes)]
         bboxes = [tmp.textbbox((0, 0), t, font=f) for t, f in zip(lines, fonts)]
         heights = [b[3] - b[1] for b in bboxes]
         total_h = sum(heights) + gap * (len(lines) - 1) + 10
-        if total_h <= max_total_height or max_size <= 10:
+        if total_h <= max_total_height or max(sizes) <= 10:
             break
-        max_size -= 2
+        shrink += 2
 
     tile_w = max(b[2] - b[0] for b in bboxes) + 10
     tile = Image.new("1", (tile_w, total_h), 0)  # พื้นดำ
@@ -291,13 +331,15 @@ def render_label_bitmap(name: str, tambon: str, house_moo: str, number: str) -> 
     # --- ข้อความแนวตั้งในแถบดำ (ขาวบนดำ): [ชื่อ เฉพาะแพมเพิส] / บ้านเลขที่-หมู่-ตำบล ---
     # ถ้าบรรทัดไหนว่าง (เช่น ป้าย sticker_text พิเศษ) จะเหลือแค่บรรทัดที่มีข้อมูล
     # ข้อความยาวเกินความยาวแถบ ฟอนต์จะหดเองเฉพาะบรรทัดนั้น (ดู render_band_tile)
-    if "แพมเพิส" not in name:
+    if not any(t in name for t in BAND_TITLES):
         name = ""
     address = " ".join(t for t in (house_moo, tambon) if t)
     lines = [t for t in (name, address) if t]
+    # คำว่า "แพมเพิส" ให้ตัวใหญ่กว่าบรรทัดที่อยู่ ดูเด่นแยกออกจากป้ายบ้านทั่วไปได้ทันที
+    line_max_sizes = [PAMPER_FONT_SIZE if t == name else 36 for t in lines]
     max_text_width = H - 20      # เผื่อขอบบน-ล่างของแถบดำข้างละ ~10px
     max_total_height = BAND_W - 16  # ทุกบรรทัดรวมกันต้องไม่ล้นความกว้างแถบดำ
-    tile = render_band_tile(lines, max_text_width, max_total_height)
+    tile = render_band_tile(lines, max_text_width, max_total_height, line_max_sizes)
     img.paste(tile, ((BAND_W - tile.width) // 2, (H - tile.height) // 2))
 
     # --- เลขใต้บาร์โค้ด (กึ่งกลางโซนขวา) ---
@@ -488,6 +530,32 @@ def build_mock_sheet(name: str, tambon: str, house_moo: str, number: str, barcod
     return sheet, have_barcode
 
 
+def _pamper_name(name: str, user_id: str, label_lines) -> str:
+    """ป้ายแพมเพิส: เว็บแอปส่ง name มาว่าง แต่ระบุว่าเป็นแพมเพิสใน label_lines
+    (เช่น ['แพมเพิส', 'บ้านเลขที่ 999 หมู่ 3 ...']) และรหัสขึ้นต้นด้วย "PM-" —
+    เจอแบบนี้ให้ใช้ชื่อ "แพมเพิส" (render_label_bitmap แสดงเฉพาะชื่อที่มีคำนี้)"""
+    if "แพมเพิส" in (name or ""):
+        return name
+    if any("แพมเพิส" in str(t) for t in (label_lines or [])) or str(user_id or "").startswith("PM-"):
+        return "แพมเพิส"
+    return name
+
+
+# หัวป้ายพิเศษที่ให้แสดงเป็นบรรทัดบนของแถบดำ (ชื่อเจ้าของบ้านทั่วไปไม่แสดง)
+BAND_TITLES = ("แพมเพิส", "วางบิล")
+
+
+def _title_address_from_label_lines(house, moo, tambon, label_lines):
+    """ป้ายพิเศษ (วางบิล/แพมเพิส): เว็บแอปส่งหัวป้ายมาในช่อง house แทนเลขบ้าน ส่วนที่อยู่
+    จริงอยู่ใน label_lines เท่านั้น เช่น {'house': 'วางบิล', 'moo': '', 'tambon': '',
+    'label_lines': ['วางบิล', 'บ้านเลขที่ 999 หมู่ 3 บ้านกิ่วแล']} — เจอแบบนี้คืน
+    (หัวป้าย, ที่อยู่ไม่มีคำนำหน้า "บ้านเลขที่") ไม่ใช่รูปแบบนี้คืน None"""
+    lines = [str(t).strip() for t in (label_lines or []) if str(t).strip()]
+    if len(lines) < 2 or house != lines[0] or moo or tambon:
+        return None
+    return lines[0], " ".join(lines[1:]).removeprefix("บ้านเลขที่").strip()
+
+
 def _resolve_item_fields(item: dict):
     """แปลง item dict ให้เป็น (id_text, name, tambon, house_moo, quantity) แบบเดียวกัน
     ไม่ว่าจะมาจาก 2 รูปแบบที่ต่างกัน:
@@ -515,11 +583,16 @@ def _resolve_item_fields(item: dict):
         if house_no and house_no == id_text:
             house_no = "ไม่มี"
         house_moo = build_house_moo_text(house=house_no, moo=moo) if (house_no or moo) else ""
-        return id_text, item.get("name", ""), tambon, house_moo, qty
+        return id_text, _pamper_name(item.get("name", ""), id_text, item.get("label_lines")), tambon, house_moo, qty
 
+    name = _pamper_name(item.get("name", ""), id_text, item.get("label_lines"))
+    titled = _title_address_from_label_lines(item.get("house", ""), item.get("moo", ""),
+                                             item.get("tambon", ""), item.get("label_lines"))
+    if titled:
+        return id_text, name or titled[0], "", titled[1], qty
     house_moo = build_house_moo_text(house=item.get("house", ""), moo=item.get("moo", ""),
                                       soi=item.get("soi", ""))
-    return id_text, item.get("name", ""), item.get("tambon", ""), house_moo, qty
+    return id_text, name, item.get("tambon", ""), house_moo, qty
 
 
 def build_mock_batch_sheet(items: list):
@@ -993,6 +1066,11 @@ class PrintRequestHandler(BaseHTTPRequestHandler):
         # ป้ายจุดเก็บแพมเพิส — backend ส่ง sticker_text มา ให้พิมพ์แค่ข้อความนั้น
         # แทนที่อยู่ (เหมือน _resolve_item_fields ฝั่ง batch)
         sticker_text = body.get("sticker_text") or ""
+        name = _pamper_name(name, user_id, body.get("label_lines"))
+        # ป้ายพิเศษ (เช่น วางบิล): house เป็นหัวป้าย ที่อยู่จริงอยู่ใน label_lines
+        titled = _title_address_from_label_lines(house, moo, tambon, body.get("label_lines"))
+        if titled:
+            name, house = name or titled[0], titled[1]
 
         # บั๊กที่เจอจากเว็บแอปจริง: บ้านที่ไม่มีเลขที่จริง จะส่ง house มาเป็นรหัส
         # สมาชิก (user_id) เอง เช่น {"user_id":"M-1005","house":"M-1005",...} แทนที่จะ
@@ -1035,6 +1113,75 @@ class PrintRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, resp)
 
 
+# ============== อัปเดตแอป (Windows ที่ติดตั้งจากตัวติดตั้ง) ==============
+def _version_tuple(v: str):
+    return tuple(int(x) for x in str(v).strip().lstrip("v").split("."))
+
+
+def fetch_update_info(manifest_url: str):
+    """อ่าน latest.json ({"version", "file", "sha256"}) จาก manifest_url — ถ้าเวอร์ชันในนั้น
+    ใหม่กว่า __version__ คืน {"version", "url", "sha256"} (url ของตัวติดตั้ง = ไฟล์ชื่อ
+    "file" ที่วางอยู่ข้าง latest.json) ไม่มีอะไรใหม่คืน None"""
+    if not manifest_url.lower().startswith("https://"):
+        raise ValueError("UPDATE_MANIFEST_URL ต้องขึ้นต้นด้วย https://")
+    with urllib.request.urlopen(manifest_url, timeout=15) as resp:
+        info = json.loads(resp.read().decode("utf-8-sig"))
+    if _version_tuple(info["version"]) <= _version_tuple(__version__):
+        return None
+    url = urllib.parse.urljoin(manifest_url, info["file"])
+    if not url.lower().startswith("https://"):
+        raise ValueError(f"URL ตัวติดตั้งไม่ใช่ https: {url}")
+    return {"version": info["version"], "url": url, "sha256": info["sha256"].lower()}
+
+
+def download_update(info: dict) -> str:
+    """โหลดตัวติดตั้งลงโฟลเดอร์ temp แล้วตรวจ sha256 ให้ตรงกับใน latest.json ก่อนคืน path"""
+    path = os.path.join(tempfile.gettempdir(), f"MaeWang-SmartPay-Setup-{info['version']}.exe")
+    digest = hashlib.sha256()
+    with urllib.request.urlopen(info["url"], timeout=60) as resp, open(path, "wb") as f:
+        while chunk := resp.read(1 << 16):
+            digest.update(chunk)
+            f.write(chunk)
+    if digest.hexdigest() != info["sha256"]:
+        os.remove(path)
+        raise ValueError("ไฟล์อัปเดตที่โหลดมาไม่ตรงกับ sha256 ใน latest.json — ยกเลิกการอัปเดต")
+    return path
+
+
+def _ask_yes_no(title: str, text: str) -> bool:
+    import ctypes
+    MB_YESNO, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, IDYES = 0x4, 0x20, 0x10000, 0x40000, 6
+    flags = MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST
+    return ctypes.windll.user32.MessageBoxW(None, text, title, flags) == IDYES
+
+
+def check_for_update():
+    """เช็กเวอร์ชันใหม่ตอนเปิดแอป — เจอแล้วถามผู้ใช้ก่อน กดตกลงถึงจะโหลดและรันตัวติดตั้ง
+    (ตัวติดตั้งปิดแอปนี้ ติดตั้งทับ แล้วเปิดแอปเวอร์ชันใหม่ให้เอง) พลาดขั้นไหนแค่ log แล้ว
+    ใช้เวอร์ชันเดิมต่อ ห้ามทำให้ print server ล้ม"""
+    try:
+        info = fetch_update_info(UPDATE_MANIFEST_URL)
+        if not info:
+            print(f"[update] ใช้เวอร์ชันล่าสุดอยู่แล้ว (v{__version__})")
+            return
+        print(f"[update] มีเวอร์ชันใหม่ v{info['version']} (ตอนนี้ v{__version__})")
+        if not _ask_yes_no("MaeWang SmartPay - อัปเดต",
+                           f"มีเวอร์ชันใหม่ v{info['version']} (ตอนนี้ใช้ v{__version__})\n\n"
+                           "อัปเดตเลยไหม? แอปจะปิดและเปิดใหม่เอง ใช้เวลาประมาณ 1 นาที\n"
+                           "(อย่ากดอัปเดตระหว่างที่กำลังพิมพ์ป้ายอยู่)"):
+            print("[update] ผู้ใช้เลือกยังไม่อัปเดต — จะถามอีกครั้งตอนเปิดแอปรอบหน้า")
+            return
+        print("[update] กำลังดาวน์โหลดตัวติดตั้ง...")
+        installer = download_update(info)
+        print("[update] กำลังติดตั้ง — แอปจะปิดและเปิดใหม่เอง")
+        subprocess.Popen([installer, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"],
+                         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                         close_fds=True)
+        os._exit(0)
+    except Exception as e:
+        print(f"[update] เช็ก/ติดตั้งอัปเดตไม่สำเร็จ ใช้เวอร์ชันเดิมต่อ: {type(e).__name__}: {e}")
+
+
 def main():
     # ต้องผูกกับ 127.0.0.1 เท่านั้น — เว็บแอป SmartPay รันเป็น HTTPS ซึ่งเบราว์เซอร์จะบล็อก3
     # การเรียก http:// ไปยัง IP อื่นที่ไม่ใช่ localhost (mixed content policy) ดังนั้น
@@ -1050,8 +1197,23 @@ def main():
         print("*** MOCK MODE เปิดอยู่ — ไม่ต้องมีเครื่องพิมพ์ต่อ USB ก็ทดสอบได้")
         print(f"*** /print จะเซฟรูปพรีวิวไว้ที่ {PREVIEW_DIR}/ แทนการพิมพ์จริง")
         print("=" * 60)
-    httpd = HTTPServer(("127.0.0.1", PRINT_SERVER_PORT), PrintRequestHandler)
-    print(f"Print server กำลังทำงานที่ http://localhost:{PRINT_SERVER_PORT}")
+    open_browser = FROZEN and "--no-browser" not in sys.argv
+    try:
+        httpd = HTTPServer(("127.0.0.1", PRINT_SERVER_PORT), PrintRequestHandler)
+    except OSError:
+        if not FROZEN:
+            raise
+        # เปิดแอปซ้ำทั้งที่ตัวแรกยังรันอยู่ (พอร์ตถูกใช้แล้ว) — ไม่ต้องเปิด server ซ้อน
+        print(f"*** พอร์ต {PRINT_SERVER_PORT} ถูกใช้อยู่แล้ว — print server น่าจะเปิดอยู่แล้ว")
+        if open_browser:
+            webbrowser.open(SMARTPAY_LOGIN_URL)
+        time.sleep(5)  # ให้ทันอ่านข้อความก่อนหน้าต่างปิด
+        return
+    print(f"Print server v{__version__} กำลังทำงานที่ http://localhost:{PRINT_SERVER_PORT}")
+    if open_browser:
+        webbrowser.open(SMARTPAY_LOGIN_URL)
+    if FROZEN and sys.platform == "win32" and UPDATE_MANIFEST_URL:
+        threading.Thread(target=check_for_update, daemon=True).start()
     print("รอรับคำสั่งพิมพ์จากเว็บแอป SmartPay (POST /print) — กด Ctrl+C เพื่อหยุด")
     try:
         httpd.serve_forever()

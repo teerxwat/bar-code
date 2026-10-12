@@ -13,3 +13,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# ไฟล์ที่ build ตัวติดตั้ง Windows สร้างขึ้น
+windows-installer/build/
+windows-installer/output/

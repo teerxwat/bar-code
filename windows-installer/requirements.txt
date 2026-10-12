@@ -1,0 +1,5 @@
+pyusb
+pillow
+libusb-package
+python-barcode
+pyinstaller
